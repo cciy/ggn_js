@@ -1,127 +1,258 @@
 // ==UserScript==
-// @name         TheLounge Ultimate Emoji Picker (Embedded & Robust)
+// @name         The Lounge 手机/PC通用增强版 (API修复+黑名单)
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  （Add a built-in data emoji selector to TheLounge, compatible with all versions.）为 TheLounge 添加一个内置数据的表情选择器，兼容各种版本
+// @version      7.0
+// @description  修复“不支持跨域请求”错误。适配手机，支持翻译/引用/黑名单/跳转保底。
+// @author       Gemini
 // @match        https://i.uddd.de/*
 // @match        http://i.uddd.de/*
-// @grant        none
-// @run-at       document-idle
+// @connect      translate.googleapis.com
+// @connect      google.com
+// @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+// @grant        GM_openInTab
 // ==/UserScript==
 (function() {
-  'use strict';
-    // 配置：引用按钮的文本
-const QUOTE_BUTTON_TEXT = '[引用]';
+'use strict';
 
-    const style = document.createElement('style');
-    style.innerHTML = `
-        .quote-btn {
-            cursor: pointer;
-            font-size: 0.8em;
-            color: #888;
-            margin-left: 8px;
-            user-select: none;
-            opacity: 0.6;
-        }
-        .quote-btn:hover {
-            color: #fff;
-            opacity: 1;
-            text-decoration: underline;
-        }
-    `;
-    document.head.appendChild(style);
+    // ==========================================
+    // 【配置区域】黑名单
+    // ==========================================
+    const IGNORED_USERS = [
+        'Vertigo',
+        'ChanServ',
+        'NickServ',
+    ];
+    // ==========================================
 
-    function processMessageNode(node) {
-        if (node.nodeType !== 1) return;
-        if (!node.classList.contains('msg') ||
-            node.classList.contains('status') ||
-            node.classList.contains('self')) {
-            return;
-        }
-        if (node.querySelector('.quote-btn')) return;
+    console.log("【The Lounge V15】启动 (内部对齐模式)...");
 
-        const contentDiv = node.querySelector('.content');
-        if (!contentDiv) return;
+    // ==========================================
+    // 1. 样式注入
+    // ==========================================
+    function injectStyles() {
+        const css = `
+            /* === 按钮容器 (紧跟在文字后面) === */
+            .my-tl-actions {
+                display: inline-block;
+                margin-left: 8px;
+                vertical-align: middle;
+                user-select: none;
+            }
 
-        const btn = document.createElement('span');
-        btn.className = 'quote-btn';
-        btn.innerText = QUOTE_BUTTON_TEXT;
+            /* === 翻译结果行 (嵌入在内容内部，从而实现对齐) === */
+            .my-trans-pure {
+                display: block;        /* 强制换行 */
+                margin-top: 6px;       /* 拉开间距 */
+                padding-top: 4px;
+                border-top: 1px dashed rgba(120, 120, 120, 0.3); /* 虚线分割 */
 
-        btn.onclick = function(e) {
-            e.preventDefault();
-            doQuote(node);
-        };
+                color: #ff9800;        /* 橙色高亮 */
+                font-size: 1.05em;
+                line-height: 1.5;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+                clear: both;           /* 清除浮动 */
+            }
 
-        contentDiv.appendChild(btn);
+            /* 暗黑模式适配 */
+            @media (prefers-color-scheme: dark) {
+                .my-trans-pure { color: #81d4fa; border-top-color: rgba(255,255,255,0.15); }
+            }
+            body.theme-dark .my-trans-pure { color: #81d4fa; border-top-color: rgba(255,255,255,0.15); }
+
+
+            /* === 电脑端 PC (鼠标悬停显示按钮) === */
+            @media (min-width: 769px) {
+                /* 默认完全隐藏 */
+                .my-tl-actions {
+                    opacity: 0;
+                    transition: opacity 0.2s;
+                }
+                /* 只有鼠标移到这一行消息时，才显示按钮 */
+                div.msg:hover .my-tl-actions {
+                    opacity: 1;
+                }
+
+                /* 极简文字按钮 */
+                .my-tl-btn {
+                    cursor: pointer;
+                    color: #999;
+                    margin-right: 8px;
+                    font-size: 12px;
+                    padding: 0 2px;
+                }
+                .my-tl-btn:hover {
+                    color: #2196f3;
+                    text-decoration: underline;
+                }
+            }
+
+            /* === 手机端 Mobile (一直显示) === */
+            @media (max-width: 768px) {
+                .my-tl-actions {
+                    opacity: 1 !important;
+                    margin-top: 4px;
+                    display: block; /* 手机上防止太挤，允许按钮换行 */
+                }
+                .my-tl-btn {
+                    display: inline-block;
+                    padding: 4px 10px;
+                    margin-right: 8px;
+                    border: 1px solid #ccc;
+                    border-radius: 12px;
+                    font-size: 13px;
+                }
+            }
+        `;
+        const style = document.createElement('style');
+        style.type = 'text/css';
+        style.innerHTML = css;
+        document.head.appendChild(style);
     }
 
-    function doQuote(msgNode) {
-        const userElem = msgNode.querySelector('.from .user') || msgNode.querySelector('.from');
-        const contentElem = msgNode.querySelector('.content');
-
-        if (!userElem || !contentElem) return;
-
-        let username = userElem.innerText.trim();
-        let contentClone = contentElem.cloneNode(true);
-        let quoteBtns = contentClone.querySelectorAll('.quote-btn');
-        quoteBtns.forEach(b => b.remove());
-        let messageText = contentClone.innerText.trim();
-
-        const quoteText = `${username}: ${messageText} `;
-
-        insertTextToInput(quoteText);
+    // ==========================================
+    // 2. 跨域请求
+    // ==========================================
+    function safeRequest(url, onload, onerror) {
+        if (typeof GM_xmlhttpRequest !== 'undefined') {
+            GM_xmlhttpRequest({ method: "GET", url: url, onload: onload, onerror: onerror });
+        } else if (typeof GM !== 'undefined' && GM.xmlHttpRequest) {
+            GM.xmlHttpRequest({ method: "GET", url: url, onload: onload, onerror: onerror });
+        } else {
+            throw new Error("NoAPI");
+        }
     }
 
-    /**
-     * 修改后的插入函数：插入文本后，光标跳到最前面
-     */
-    function insertTextToInput(text) {
+    // ==========================================
+    // 3. 核心功能
+    // ==========================================
+    function doTranslate(text, container, webUrl) {
+        if (!text) return;
+        container.innerHTML = '<span style="color:#888;font-size:0.9em;">...</span>';
+
+        const apiUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${encodeURIComponent(text)}`;
+
+        try {
+            safeRequest(apiUrl,
+                (res) => {
+                    try {
+                        const data = JSON.parse(res.responseText);
+                        let str = "";
+                        if(data && data[0]) data[0].forEach(s => { if(s[0]) str += s[0]; });
+                        container.textContent = str || "无结果";
+                    } catch(e) {
+                        container.innerHTML = `<a href="${webUrl}" target="_blank" style="color:red;font-size:12px">解析错</a>`;
+                    }
+                },
+                (err) => {
+                    container.innerHTML = `<a href="${webUrl}" target="_blank" style="color:red;font-size:12px">请求被阻</a>`;
+                }
+            );
+        } catch (e) {
+            container.innerHTML = `<a href="${webUrl}" target="_blank" style="color:red;font-size:12px">无权限</a>`;
+        }
+    }
+
+    function doQuote(username, text) {
         const input = document.getElementById('input');
         if (!input) return;
-
-        const originalValue = input.value;
-
-        // 这里依然是把引用内容“追加”到当前内容的后面
-        // 如果你希望引用内容本身也插到最前面，可以将下面改为: input.value = text + originalValue;
-        if (!originalValue) {
-            input.value = text;
-        } else {
-            input.value = originalValue + (originalValue.endsWith(' ') ? '' : ' ') + text;
-        }
-
+        let processedText = text.length > 150 ? text.substring(0, 150) + "..." : text;
+        const quoteStr = ` - [${username}]: ${processedText} `;
+        input.value = (input.value ? input.value + " " : "") + quoteStr;
         input.focus();
-
-        // --- 核心修改：将光标位置设置为 0 (最前面) ---
-        // setSelectionRange(start, end)
         input.setSelectionRange(0, 0);
-        // ----------------------------------------
-
-        // 触发 input 事件让 Vue 感知到变化
-        const event = new Event('input', { bubbles: true });
-        input.dispatchEvent(event);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
-    const observer = new MutationObserver((mutations) => {
-        mutations.forEach((mutation) => {
-            mutation.addedNodes.forEach((node) => {
-                if (node.nodeType === 1 && node.classList && node.classList.contains('msg')) {
-                    processMessageNode(node);
-                }
-                if (node.nodeType === 1 && node.querySelectorAll) {
-                    const nestedMsgs = node.querySelectorAll('.msg');
-                    nestedMsgs.forEach(processMessageNode);
-                }
-            });
-        });
-    });
+    // ==========================================
+    // 4. DOM 处理 (关键修正：全部插入到 content 内部)
+    // ==========================================
+    function processMsg(node) {
+        if (node.querySelector('.my-tl-actions')) return;
+        if (node.getAttribute('data-type') !== 'message') return;
 
-    observer.observe(document.body, {
-        childList: true,
-        subtree: true
-    });
+        const rawUsername = node.getAttribute('data-from');
+        if (rawUsername && IGNORED_USERS.includes(rawUsername)) {
+            node.setAttribute('data-tl-ignored', 'true');
+            return;
+        }
 
+        // 获取内容容器
+        const contentEl = node.querySelector('.content');
+        if (!contentEl) return;
+
+        // 1. 创建按钮容器
+        const actionSpan = document.createElement('span');
+        actionSpan.className = 'my-tl-actions';
+
+        const btnT = document.createElement('span');
+        btnT.innerText = '[翻译]';
+        btnT.className = 'my-tl-btn';
+        btnT.onclick = (e) => {
+            e.preventDefault(); e.stopPropagation();
+            toggleTranslate(contentEl); // 注意：这里只传 contentEl
+        };
+
+        const btnQ = document.createElement('span');
+        btnQ.innerText = '[引用]';
+        btnQ.className = 'my-tl-btn';
+        btnQ.onclick = (e) => {
+            e.preventDefault(); e.stopPropagation();
+            // 引用时需要排除掉我们的翻译块和按钮
+            const clone = contentEl.cloneNode(true);
+            const garbage = clone.querySelectorAll('.my-tl-actions, .my-trans-pure');
+            garbage.forEach(g => g.remove());
+            doQuote(rawUsername || "User", clone.innerText.trim());
+        };
+
+        actionSpan.appendChild(btnT);
+        actionSpan.appendChild(btnQ);
+
+        // 【关键修正点】
+        // 直接追加到 .content 内部！
+        // 这样按钮就在文字后面，翻译块就在文字下面（并且是对齐的）
+        contentEl.appendChild(actionSpan);
+    }
+
+    // 切换翻译显示
+    function toggleTranslate(contentEl) {
+        let transDiv = contentEl.querySelector('.my-trans-pure');
+
+        if (!transDiv) {
+            transDiv = document.createElement('div');
+            transDiv.className = 'my-trans-pure';
+            transDiv.textContent = "翻译中...";
+
+            // 追加到 .content 内部的最后
+            contentEl.appendChild(transDiv);
+
+            // 获取原文：需要克隆并去除按钮
+            const clone = contentEl.cloneNode(true);
+            const garbage = clone.querySelectorAll('.my-tl-actions, .my-trans-pure');
+            garbage.forEach(g => g.remove());
+            const text = clone.innerText.trim();
+
+            const webUrl = `https://translate.google.com/?sl=auto&tl=zh-CN&text=${encodeURIComponent(text)}&op=translate`;
+            doTranslate(text, transDiv, webUrl);
+        } else {
+            transDiv.style.display = (transDiv.style.display === 'none') ? 'block' : 'none';
+        }
+    }
+
+    // ==========================================
+    // 5. 启动
+    // ==========================================
+    injectStyles();
+
+    function scan() {
+        document.querySelectorAll('div.msg[data-type="message"]:not([data-tl-ignored])').forEach(processMsg);
+    }
+
+    const observer = new MutationObserver(scan);
     setTimeout(() => {
-        document.querySelectorAll('.msg').forEach(processMessageNode);
+        scan();
+        observer.observe(document.body, { childList: true, subtree: true });
     }, 1000);
 
   // --- 1. 海量表情库 (含 simplemap 兼容 + 中文 + 英文关键词) ---
