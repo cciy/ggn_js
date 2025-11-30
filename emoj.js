@@ -158,7 +158,7 @@
         const input = document.getElementById('input');
         if (!input) return;
         let processedText = text.length > 150 ? text.substring(0, 150) + "..." : text;
-        const quoteStr = ` - [${username}]: ${processedText} `;
+        const quoteStr = ` - [ ${username} ]: ${processedText} `;
         input.value = (input.value ? input.value + " " : "") + quoteStr;
         input.focus();
         input.setSelectionRange(0, 0);
